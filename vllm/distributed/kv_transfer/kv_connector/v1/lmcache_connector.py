@@ -117,6 +117,11 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
     # ==============================
     # Worker-side methods
     # ==============================
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        if hasattr(self._lmcache_engine, "prefetch_segmented_kv"):
+            self._lmcache_engine.prefetch_segmented_kv(connector_metadata)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
         Initialize with the KV caches. Useful for pre-registering the
@@ -149,6 +154,22 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
         """
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
+
+    def start_segmented_kv_load(
+        self, forward_context: "ForwardContext", **kwargs: Any
+    ) -> None:
+        """
+        Start loading KV for segmented overlap mode.
+
+        This triggers only the segmented/layerwise LMCache load path so model
+        code can launch deep-layer retrieval earlier than the normal full
+        forward execution path.
+
+        Args:
+            forward_context (ForwardContext): the forward context.
+            **kwargs: additional arguments for the load operation
+        """
+        self._lmcache_engine.start_segmented_kv_load(forward_context, **kwargs)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """

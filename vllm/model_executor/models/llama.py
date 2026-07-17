@@ -25,7 +25,9 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
+from dataclasses import replace
 from itertools import islice
+import time
 
 import torch
 from torch import nn
@@ -34,6 +36,7 @@ from transformers import LlamaConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import (
     Attention,
@@ -76,6 +79,8 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class LlamaMLP(nn.Module):
@@ -412,22 +417,195 @@ class LlamaModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
-        ):
-            hidden_states, residual = layer(
-                positions, hidden_states, residual, **extra_layer_kwargs
-            )
-            self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
-            )
+        overlap_enabled = False
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+            is_v1_kv_transfer_group,
+        )
+        from vllm.forward_context import get_forward_context, override_forward_context
 
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+        if has_kv_transfer_group() and is_v1_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            
+            # # LMCache wrapper
+            # impl = getattr(connector, "_lmcache_engine", None)
+            # if impl is not None and hasattr(impl, "kv_caches"):
+            #     kv_caches = impl.kv_caches  # dict[layer_name -> torch.Tensor]
+            #     layer16_kv = kv_caches.get("model.layers.16.self_attn.attn")
+                
+            if connector.has_connector_metadata():
+                connector_metadata = connector._get_connector_metadata()
+                has_segmented_request = any(
+                    getattr(request, "segment_spec", None) is not None
+                    and getattr(request, "load_spec", None) is not None
+                    and request.load_spec.can_load
+                    for request in connector_metadata.requests
+                )
 
+                attn_metadata_map = get_forward_context().attn_metadata
+                is_prefill = False
+                if isinstance(attn_metadata_map, dict) and len(attn_metadata_map) > 0:
+                    sample_attn_metadata = next(iter(attn_metadata_map.values()))
+                    is_prefilling = getattr(sample_attn_metadata, "is_prefilling", None)
+                    if is_prefilling is not None:
+                        is_prefill = bool(is_prefilling.any().item())
+                    else:
+                        query_start_loc_cpu = getattr(
+                            sample_attn_metadata, "query_start_loc_cpu", None
+                        )
+                        query_start_loc = getattr(
+                            sample_attn_metadata, "query_start_loc", None
+                        )
+                        query_boundaries = query_start_loc_cpu
+                        if query_boundaries is None:
+                            query_boundaries = query_start_loc
+                        if query_boundaries is not None and query_boundaries.numel() > 1:
+                            query_lens = query_boundaries[1:] - query_boundaries[:-1]
+                            is_prefill = bool((query_lens > 1).any().item())
+
+                overlap_enabled = has_segmented_request and is_prefill
+
+        if overlap_enabled:
+            shallow_start = 0
+            shallow_end = self.end_layer
+            query_start = hidden_states.shape[0]
+
+            # Launch deep-layer KV loading before running the shallow prefix.
+            if has_kv_transfer_group() and is_v1_kv_transfer_group():
+                if connector.has_connector_metadata():
+                    connector_metadata = connector._get_connector_metadata()
+                    if len(connector_metadata.requests) > 0:
+                        request = connector_metadata.requests[0]
+                        if getattr(request, "segment_spec", None) is not None:
+                            shallow_end = request.segment_spec.start_layer
+                            query_start = request.segment_spec.prefix_tokens
+                    logger.info(
+                        "[TIMING] llama before_segmented_load %.6f",
+                        time.time(),
+                    )
+                    connector.start_segmented_kv_load(get_forward_context())
+                    logger.info(
+                        "[TIMING] llama after_segmented_load %.6f shallow=%d "
+                        "query_start=%d seq_len=%d",
+                        time.time(),
+                        shallow_end,
+                        query_start,
+                        hidden_states.shape[0],
+                    )
+            # Prefill the shallow layers for the full sequence.
+            logger.info(
+                "[TIMING] llama before_shallow_loop %.6f layers=%d-%d",
+                time.time(),
+                shallow_start,
+                shallow_end - 1,
+            )
+            for idx, layer in enumerate(islice(self.layers, shallow_start, shallow_end)):
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, **extra_layer_kwargs
+                )
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, idx + 1, hidden_states, residual
+                )
+            logger.info("[TIMING] llama after_shallow_loop %.6f", time.time())
+
+            # Run the deep layers only for the query suffix while the prefix
+            # KV is restored from LMCache.
+            if query_start < hidden_states.shape[0]:
+                query_hidden_states = hidden_states[query_start:]
+                query_positions = positions[query_start:]
+                query_residual = (
+                    residual[query_start:] if residual is not None else None
+                )
+                query_len = query_hidden_states.shape[0]
+                forward_context = get_forward_context()
+                query_attn_metadata = {}
+                assert isinstance(forward_context.attn_metadata, dict)
+                assert isinstance(forward_context.slot_mapping, dict)
+                query_start_loc_by_device: dict[torch.device, torch.Tensor] = {}
+                query_slot_mapping = {
+                    layer_name: slot_mapping[query_start:]
+                    for layer_name, slot_mapping in forward_context.slot_mapping.items()
+                }
+                for layer_name, attn_metadata in forward_context.attn_metadata.items():
+                    device = attn_metadata.query_start_loc.device
+                    query_start_loc = query_start_loc_by_device.get(device)
+                    if query_start_loc is None:
+                        query_start_loc = torch.tensor(
+                            [0, query_len],
+                            device=device,
+                            dtype=attn_metadata.query_start_loc.dtype,
+                        )
+                        query_start_loc_by_device[device] = query_start_loc
+                    query_attn_metadata[layer_name] = replace(
+                        attn_metadata,
+                        num_actual_tokens=query_len,
+                        max_query_len=query_len,
+                        query_start_loc=query_start_loc,
+                        scheduler_metadata=None,
+                        prefix_scheduler_metadata=None,
+                    )
+                query_forward_context = replace(
+                    forward_context,
+                    attn_metadata=query_attn_metadata,
+                    slot_mapping=query_slot_mapping,
+                )
+
+                with override_forward_context(query_forward_context):
+                    logger.info(
+                        "[TIMING] llama before_deep_query_loop %.6f layers=%d-%d "
+                        "query_len=%d",
+                        time.time(),
+                        shallow_end,
+                        self.end_layer - 1,
+                        query_len,
+                    )
+                    for idx, layer in enumerate(
+                        islice(self.layers, shallow_end, self.end_layer),
+                        start=shallow_end,
+                    ):
+                        query_hidden_states, query_residual = layer(
+                            query_positions,
+                            query_hidden_states,
+                            query_residual,
+                            **extra_layer_kwargs,
+                        )
+                        self._maybe_add_hidden_state(
+                            aux_hidden_states,
+                            idx + 1,
+                            query_hidden_states,
+                            query_residual,
+                        )
+                    logger.info(
+                        "[TIMING] llama after_deep_query_loop %.6f",
+                        time.time(),
+                    )
+
+                hidden_states = hidden_states.clone()
+                hidden_states[query_start:] = query_hidden_states
+                if residual is not None and query_residual is not None:
+                    residual = residual.clone()
+                    residual[query_start:] = query_residual
+
+        else:
+            for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer)
+            ):
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, **extra_layer_kwargs
+                )
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, idx + 1, hidden_states, residual
+                )
+
+            if not get_pp_group().is_last_rank:
+                return IntermediateTensors(
+                    {"hidden_states": hidden_states, "residual": residual}
+                )
+
+        logger.info("[TIMING] llama before_norm %.6f", time.time())
         hidden_states, _ = self.norm(hidden_states, residual)
+        logger.info("[TIMING] llama after_norm %.6f", time.time())
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -578,7 +756,9 @@ class LlamaForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        logger.info("[TIMING] llama before_logits %.6f", time.time())
         logits = self.logits_processor(self.lm_head, hidden_states)
+        logger.info("[TIMING] llama after_logits %.6f", time.time())
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

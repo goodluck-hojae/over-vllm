@@ -5,6 +5,7 @@ Define KV connector functionality mixin for model runners.
 """
 
 import copy
+import time
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -93,16 +94,30 @@ class KVConnectorModelRunnerMixin:
         kv_connector = get_kv_transfer_group()
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
+        logger.info(
+            "[TIMING] kv_connector bind_metadata start %.6f metadata=%s",
+            time.time(),
+            type(scheduler_output.kv_connector_metadata).__name__,
+        )
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        logger.info(
+            "[TIMING] kv_connector bind_metadata end %.6f",
+            time.time(),
+        )
 
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
-        kv_connector.start_load_kv(get_forward_context())
+        # Disabled for segmented-overlap debugging to avoid launching
+        # the worker-side load path in addition to the manual early
+        # connector.start_segmented_kv_load(...) trigger in llama.py.
+        ### kv_connector.start_load_kv(get_forward_context())
         try:
+            logger.info("[TIMING] kv_connector context yield %.6f", time.time())
             yield output
         finally:
+            logger.info("[TIMING] kv_connector finalize start %.6f", time.time())
             if wait_for_save and not defer_finalize:
                 kv_connector.wait_for_save()
 
@@ -117,6 +132,7 @@ class KVConnectorModelRunnerMixin:
 
             if not defer_finalize:
                 kv_connector.clear_connector_metadata()
+            logger.info("[TIMING] kv_connector finalize end %.6f", time.time())
 
     @staticmethod
     def use_uniform_kv_cache(

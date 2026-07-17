@@ -307,6 +307,21 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def start_segmented_kv_load(
+        self, forward_context: "ForwardContext", **kwargs: Any
+    ) -> None:
+        """
+        Start loading KV for a segmented/layerwise overlap path.
+
+        Connectors that support an earlier segmented-load trigger can override
+        this method. By default it falls back to the normal load path.
+
+        Args:
+            forward_context (ForwardContext): the forward context.
+            **kwargs: additional arguments for the load operation
+        """
+        return
+
     @abstractmethod
     def wait_for_layer_load(self, layer_name: str) -> None:
         """

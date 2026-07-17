@@ -4228,6 +4228,8 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            logger.info("[TIMING] gpu_model_runner before_model_forward %.6f",
+                        time.time())
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4235,8 +4237,12 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            logger.info("[TIMING] gpu_model_runner after_model_forward %.6f",
+                        time.time())
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            logger.info("[TIMING] gpu_model_runner postprocess start %.6f",
+                        time.time())
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4264,7 +4270,11 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                logger.info("[TIMING] gpu_model_runner before_compute_logits %.6f",
+                            time.time())
                 logits = self.model.compute_logits(sample_hidden_states)
+                logger.info("[TIMING] gpu_model_runner after_compute_logits %.6f",
+                            time.time())
             else:
                 # Rare case.
                 assert not self.is_pooling_model
